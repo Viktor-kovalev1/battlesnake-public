@@ -1,11 +1,8 @@
 """
 Модуль логики выбора хода для змеи Battlesnake.
  
-Реализует гибридный алгоритм принятия решений:
-1. Первичный: безопасная фильтрация ходов, симуляция на 1–2 хода вперёд,
-   многокритериальная оценка состояния с динамическими весами.
-2. Запасной (fallback): оригинальная модель машинного обучения (линейная)
-   и эвристика, гарантирующая легальный ход в любой ситуации.
+Реализует гибридный алгоритм принятия решений с симуляцией, динамическими
+весами и улучшенной оценкой пространства для предотвращения застревания.
  
 Координаты доски: (0, 0) — нижний левый угол.
   up    -> y + 1
@@ -468,39 +465,54 @@ def choose_move_heuristic(game_state: Dict) -> str:
     return best_move or "up"
  
 # ======================================================================
-#  НОВЫЙ УЛУЧШЕННЫЙ АЛГОРИТМ (симуляция + динамические веса)
+#  НОВЫЙ УЛУЧШЕННЫЙ АЛГОРИТМ (симуляция + динамические веса + умные враги)
 # ======================================================================
  
-def get_safe_moves(state: Dict) -> List[str]:
+def get_safe_moves(state: Dict, snake_id: Optional[str] = None) -> List[str]:
     """
-    Возвращает список ходов, которые не ведут к немедленной гибели.
+    Возвращает список ходов, которые не ведут к немедленной гибели для указанной змеи.
  
     Проверяет:
         - выход за пределы доски,
         - столкновение с телами змей,
         - проигрышное столкновение головами (с более длинным или равным врагом).
  
+    Если snake_id не указан, используется наша змея (state['you']['id']).
+ 
     Args:
         state (Dict): Игровое состояние.
+        snake_id (Optional[str]): Идентификатор змеи. Если None, берётся наша.
  
     Returns:
         List[str]: Список безопасных направлений.
     """
-    my_head = state['you']['head']
-    my_length = state['you']['length']
+    if snake_id is None:
+        snake_id = state['you']['id']
+ 
+    # Находим змею по id
+    snake = None
+    for s in state['board']['snakes']:
+        if s['id'] == snake_id:
+            snake = s
+            break
+    if snake is None:
+        return []
+ 
+    my_head = snake['head']
+    my_length = snake['length']
     board = state['board']
     width, height = board['width'], board['height']
  
     occupied = set()
-    for snake in board['snakes']:
-        for seg in snake['body']:
+    for s in board['snakes']:
+        for seg in s['body']:
             occupied.add((seg['x'], seg['y']))
  
     # Сопоставляем голову врага с его длиной
     head_to_length = {}
-    for snake in board['snakes']:
-        head = snake['head']
-        head_to_length[(head['x'], head['y'])] = snake['length']
+    for s in board['snakes']:
+        h = s['head']
+        head_to_length[(h['x'], h['y'])] = s['length']
  
     safe = []
     for move, (dx, dy) in DIRECTIONS.items():
@@ -556,6 +568,39 @@ def flood_fill_space(head: Dict, board: Dict, max_steps: int) -> int:
                 if (nx, ny) not in visited and (nx, ny) not in occupied:
                     visited.add((nx, ny))
                     q.append((nx, ny, dist + 1))
+    return count
+ 
+def component_size(head: Dict, board: Dict) -> int:
+    """
+    Возвращает размер связной области (все достижимые клетки),
+    игнорируя тела змей как препятствия. Не ограничивает глубину.
+ 
+    Args:
+        head (Dict): Координаты головы.
+        board (Dict): Игровая доска.
+ 
+    Returns:
+        int: Размер компоненты.
+    """
+    occupied = set()
+    for snake in board['snakes']:
+        for seg in snake['body']:
+            occupied.add((seg['x'], seg['y']))
+ 
+    visited = set()
+    stack = [(head['x'], head['y'])]
+    visited.add((head['x'], head['y']))
+    count = 0
+ 
+    while stack:
+        x, y = stack.pop()
+        count += 1
+        for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < board['width'] and 0 <= ny < board['height']:
+                if (nx, ny) not in visited and (nx, ny) not in occupied:
+                    visited.add((nx, ny))
+                    stack.append((nx, ny))
     return count
  
 def min_distance_to_food(head: Dict, board: Dict) -> Optional[int]:
@@ -729,12 +774,12 @@ def apply_move_to_snake(state: Dict, snake_id: str, move: str) -> Dict:
     snake['head'] = new_head
     return state
  
-def choose_opponent_move(state: Dict, snake: Dict) -> str:
+def choose_opponent_move_smart(state: Dict, snake: Dict) -> str:
     """
-    Определяет ход для вражеской змеи в симуляции.
+    Умная эвристика для выбора хода вражеской змеи в симуляции.
  
-    Сначала пытается двигаться прямо, затем поворачивает влево или вправо.
-    Избегает стен и тел.
+    Использует те же безопасные ходы и оценку по пространству и еде,
+    но без рекурсивной симуляции.
  
     Args:
         state (Dict): Игровое состояние.
@@ -743,41 +788,47 @@ def choose_opponent_move(state: Dict, snake: Dict) -> str:
     Returns:
         str: Направление хода.
     """
+    safe = get_safe_moves(state, snake['id'])
+    if not safe:
+        return 'up'
+ 
+    board = state['board']
+    width, height = board['width'], board['height']
     head = snake['head']
-    if len(snake['body']) > 1:
-        prev = snake['body'][1]
-        dx = head['x'] - prev['x']
-        dy = head['y'] - prev['y']
-        straight = None
-        for move, (mx, my) in DIRECTIONS.items():
-            if mx == dx and my == dy:
-                straight = move
-                break
-        if straight:
-            nx = head['x'] + dx
-            ny = head['y'] + dy
-            if 0 <= nx < state['board']['width'] and 0 <= ny < state['board']['height']:
-                occupied = set()
-                for s in state['board']['snakes']:
-                    for seg in s['body']:
-                        occupied.add((seg['x'], seg['y']))
-                if (nx, ny) not in occupied:
-                    return straight
-        # Если прямо нельзя, пробуем повернуть (кроме разворота)
-        for move, (mx, my) in DIRECTIONS.items():
-            if (mx, my) == (-dx, -dy):
-                continue
-            nx = head['x'] + mx
-            ny = head['y'] + my
-            if 0 <= nx < state['board']['width'] and 0 <= ny < state['board']['height']:
-                occupied = set()
-                for s in state['board']['snakes']:
-                    for seg in s['body']:
-                        occupied.add((seg['x'], seg['y']))
-                if (nx, ny) not in occupied:
-                    return move
-    # Если ничего не подошло — едем вверх (аварийно)
-    return 'up'
+    my_length = snake['length']
+    health = snake['health']
+    foods = board['food']
+ 
+    best_move = None
+    best_score = -float('inf')
+ 
+    for move in safe:
+        dx, dy = DIRECTIONS[move]
+        nxt = (head['x'] + dx, head['y'] + dy)
+ 
+        occupied = set()
+        for s in board['snakes']:
+            for seg in s['body']:
+                occupied.add((seg['x'], seg['y']))
+ 
+        # Пространство после хода
+        space = _flood_fill(nxt, occupied, width, height, limit=my_length + 1)
+        score = float(space)
+ 
+        # Если голоден, поощряем движение к еде
+        if foods and health < HUNGRY_THRESHOLD:
+            nearest = min(_manhattan(nxt, f) for f in foods)
+            score += (width + height - nearest) * 2
+ 
+        # Избегаем стен (штраф за близость к углу)
+        min_dist_to_wall = min(nxt[0], width - 1 - nxt[0], nxt[1], height - 1 - nxt[1])
+        score += min_dist_to_wall * 0.5
+ 
+        if score > best_score:
+            best_score = score
+            best_move = move
+ 
+    return best_move or 'up'
  
 def update_after_moves(state: Dict) -> Dict:
     """
@@ -822,7 +873,7 @@ def simulate_state(state: Dict, move: str, depth: int) -> Dict:
     """
     Симулирует игру на depth ходов вперёд, начиная с хода нашей змеи = move.
  
-    Противники двигаются по простой эвристике (прямо/поворот).
+    Противники двигаются по умной эвристике (choose_opponent_move_smart).
  
     Args:
         state (Dict): Исходное игровое состояние.
@@ -840,7 +891,7 @@ def simulate_state(state: Dict, move: str, depth: int) -> Dict:
         for snake in sim['board']['snakes']:
             if snake['id'] == sim['you']['id']:
                 continue
-            opp_move = choose_opponent_move(sim, snake)
+            opp_move = choose_opponent_move_smart(sim, snake)
             apply_move_to_snake(sim, snake['id'], opp_move)
         # Обновление (еда, хвосты)
         sim = update_after_moves(sim)
@@ -851,11 +902,13 @@ def evaluate_state(state: Dict, weights: Dict[str, float]) -> float:
     Оценивает качество состояния по нескольким критериям с заданными весами.
  
     Критерии:
-        - доступное пространство (flood fill),
+        - доступное пространство (размер компоненты связности),
         - близость к еде,
         - безопасность (риск столкновения),
         - агрессивность (возможность съесть врага),
-        - центральность.
+        - центральность,
+        - штраф за малое число свободных соседей (тупик),
+        - штраф за близость к углу.
  
     Args:
         state (Dict): Игровое состояние.
@@ -869,29 +922,55 @@ def evaluate_state(state: Dict, weights: Dict[str, float]) -> float:
     health = state['you']['health']
     my_length = state['you']['length']
  
-    # Пространство
-    space = flood_fill_space(my_head, board, max_steps=my_length)
-    max_space = board['width'] * board['height']
-    space_score = space / max_space if max_space > 0 else 0
+    # 1. Размер связной области (без ограничения по шагам)
+    comp_size = component_size(my_head, board)
+    max_possible = board['width'] * board['height']
+    space_score = comp_size / max_possible if max_possible > 0 else 0
  
-    # Еда
+    # 2. Еда
     food_dist = min_distance_to_food(my_head, board)
     food_score = 1.0 / (food_dist + 1) if food_dist is not None else 0.0
  
-    # Риск
+    # 3. Риск столкновения
     risk = compute_risk(state)
     risk_score = 1.0 - risk
  
-    # Агрессия
+    # 4. Агрессия
     aggression = compute_aggression(state)
  
-    # Центральность
+    # 5. Центральность
     center_x = board['width'] / 2.0
     center_y = board['height'] / 2.0
     center_dist = abs(my_head['x'] - center_x) + abs(my_head['y'] - center_y)
     center_score = 1.0 - center_dist / (board['width'] + board['height'])
  
-    score = (weights['space'] * space_score +
+    # 6. Штрафы против застревания в углах и тупиках
+ 
+    # 6a. Количество свободных соседей у головы (escape)
+    occupied = set()
+    for snake in board['snakes']:
+        for seg in snake['body']:
+            occupied.add((seg['x'], seg['y']))
+    escape = 0
+    for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+        nx, ny = my_head['x'] + dx, my_head['y'] + dy
+        if 0 <= nx < board['width'] and 0 <= ny < board['height']:
+            if (nx, ny) not in occupied:
+                escape += 1
+    # Если escape < 3, это потенциальный тупик – штрафуем (плавно)
+    escape_penalty = max(0, (3 - escape) / 3)  # от 0 до 1
+ 
+    # 6b. Близость к углу (чем ближе, тем хуже)
+    corners = [(0, 0), (0, board['height']-1), (board['width']-1, 0), (board['width']-1, board['height']-1)]
+    min_corner_dist = min(abs(my_head['x'] - cx) + abs(my_head['y'] - cy) for cx, cy in corners)
+    # Нормализуем: если дистанция 0..(width+height), то corner_penalty = 1 - min_corner_dist / (width+height)
+    corner_penalty = 1.0 - min_corner_dist / (board['width'] + board['height'])
+ 
+    # Корректируем пространственный скоринг с учётом штрафов
+    adjusted_space = space_score - 0.3 * corner_penalty - 0.2 * escape_penalty
+    adjusted_space = max(0, adjusted_space)  # не может быть отрицательным
+ 
+    score = (weights['space'] * adjusted_space +
              weights['food'] * food_score +
              weights['risk'] * risk_score +
              weights['aggression'] * aggression +
@@ -908,11 +987,12 @@ def choose_move(game_state: Dict) -> str:
  
     Реализует улучшенный алгоритм:
         1. Фильтрация безопасных ходов.
-        2. Если ходов несколько — симуляция на 1–2 хода вперёд.
-        3. Оценка каждого симулированного состояния по нескольким критериям
-           с динамическими весами.
-        4. Выбор хода с максимальной оценкой.
-        5. При любой ошибке или отсутствии хода — переход к оригинальной
+        2. Адаптивная глубина симуляции (зависит от доступного пространства).
+        3. Симуляция на depth ходов с умным поведением противников.
+        4. Оценка каждого симулированного состояния по нескольким критериям
+           с динамическими весами и штрафами за тупики.
+        5. Выбор хода с максимальной оценкой.
+        6. При любой ошибке или отсутствии хода — переход к оригинальной
            логике (модель + эвристика).
  
     Args:
@@ -927,7 +1007,6 @@ def choose_move(game_state: Dict) -> str:
         # 1. Получаем безопасные ходы
         safe = get_safe_moves(game_state)
         if not safe:
-            # Если нет безопасных — используем оригинальный метод
             return choose_move_original(game_state)
         if len(safe) == 1:
             return safe[0]
@@ -936,8 +1015,24 @@ def choose_move(game_state: Dict) -> str:
         weights = get_dynamic_weights(game_state)
  
         # 3. Адаптивная глубина симуляции
-        num_snakes = len(game_state['board']['snakes'])
-        depth = 2 if num_snakes <= 4 else 1
+        board = game_state['board']
+        my_head = game_state['you']['head']
+        width, height = board['width'], board['height']
+        # Оцениваем долю доступного пространства
+        comp = component_size(my_head, board)
+        space_ratio = comp / (width * height) if width * height > 0 else 0
+        num_snakes = len(board['snakes'])
+ 
+        # Если пространства мало – симулируем глубже, чтобы найти выход
+        if space_ratio < 0.2 and num_snakes <= 3:
+            depth = 3
+        elif space_ratio < 0.3 or num_snakes <= 4:
+            depth = 2
+        else:
+            depth = 1
+ 
+        # Ограничиваем глубину, чтобы уложиться по времени (можно увеличить, если позволяет)
+        depth = min(depth, 3)
  
         best_move = None
         best_score = -float('inf')
@@ -949,7 +1044,7 @@ def choose_move(game_state: Dict) -> str:
                 best_score = score
                 best_move = move
  
-            # Контроль времени (не более 0.45 сек, чтобы уложиться в лимит 500 мс)
+            # Контроль времени (не более 0.45 сек)
             if time.time() - start_time > 0.45:
                 break
  
